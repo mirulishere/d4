@@ -1,93 +1,147 @@
-import os
+import csv
 import subprocess
+import logging
+import argparse
+import matplotlib.pyplot as plt
+import time
 
-class Uad:
-    """Driver class for FIR Filter Hardware"""
-    def __init__(self, inst):
-        self.inst = inst
+# ===============================
+# CONSTANTS
+# ===============================
+CSR_FILTER_EN_BIT = 0
+CSR_COEF_EN_BASE  = 1
+CSR_HALT_BIT      = 5
+MAX_INPUT_SAMPLES = 100
 
-    def reset(self):
-        os.system(f'{self.inst} com --action reset')
+# ===============================
+# ARGPARSE & LOGGING
+# ===============================
+parser = argparse.ArgumentParser(description="Full FIR Validation with Comparison Plots")
+parser.add_argument('--unit', default='impl0', help="Target hardware unit")
+args = parser.parse_args()
 
-    def enable(self):
-        os.system(f'{self.inst} com --action enable')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    def disable(self):
-        os.system(f'{self.inst} com --action disable')
+# ===============================
+# HELPER FUNCTIONS
+# ===============================
+def pack_config(cfg_file):
+    packed_coef = 0
+    packed_csr  = (1 << CSR_FILTER_EN_BIT)
 
-    def write_coef(self, index, value):
-        """Write a coefficient to the FIR"""
-        os.system(f'{self.inst} coef --index {index} --write {hex(value)}')
-
-    def write_input(self, value):
-        """Write an input sample"""
-        os.system(f'{self.inst} input --write {hex(value)}')
-
-    def read_output(self):
-        """Read one output sample"""
-        out_bytes = subprocess.check_output(f'{self.inst} output --read', shell=True)
-        return int(out_bytes.decode().strip(), 0)
-
-
-def load_coefficients(uad, cfg_file):
-    """Load coefficients from a .cfg file into the FIR"""
-    print(f"Loading coefficients from {cfg_file}")
     with open(cfg_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            idx, val = line.split()
-            uad.write_coef(int(idx), int(val, 0))
+        for row in csv.DictReader(f):
+            idx = int(row['coef'])
+            val = int(row['value'], 16)
+
+            packed_coef |= (val & 0xFF) << (idx * 8)
+
+            if row['en'] == '1':
+                packed_csr |= (1 << (CSR_COEF_EN_BASE + idx))
+
+    return packed_coef, packed_csr
 
 
-def read_vector(vec_file):
-    """Read input vector file and return list of samples"""
-    samples = []
+def configure_unit(packed_coef, packed_csr):
+    halt_val = packed_csr | (1 << CSR_HALT_BIT)
+
+    subprocess.run(
+        ["./" + args.unit, "cfg", "--address", "0x0", "--data", hex(halt_val)],
+        check=True
+    )
+    time.sleep(0.01)
+
+    subprocess.run(
+        ["./" + args.unit, "cfg", "--address", "0x4", "--data", hex(packed_coef)],
+        check=True
+    )
+
+    subprocess.run(
+        ["./" + args.unit, "cfg", "--address", "0x0", "--data", hex(packed_csr)],
+        check=True
+    )
+
+
+def drive_signal(vec_file, input_store):
+    output_vals = []
+
     with open(vec_file, 'r') as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
+            sig_str = line.strip()
+            if not sig_str:
                 continue
-            samples.append(int(line, 0))
-    return samples
+
+            res = subprocess.run(
+                ["./" + args.unit, "sig", "--data", sig_str],
+                capture_output=True,
+                text=True
+            )
+
+            try:
+                val_in  = int(sig_str, 16)
+                val_out = int(res.stdout.strip(), 16)
+
+                if len(input_store) < MAX_INPUT_SAMPLES:
+                    input_store.append(val_in)
+
+                output_vals.append(val_out)
+
+            except ValueError:
+                continue
+
+    return output_vals
 
 
-def run_filter_test(uad, cfg_file, vec_file):
-    """Run FIR test with given coefficient file and input vector"""
-    uad.reset()
-    uad.enable()
-    load_coefficients(uad, cfg_file)
+# ===============================
+# MAIN VALIDATION FLOW
+# ===============================
+def run_validation():
+    cfg_files = ['p0.cfg', 'p4.cfg', 'p7.cfg', 'p9.cfg']
+    all_results = {}
+    input_signal_data = []
 
-    input_samples = read_vector(vec_file)
-    output_samples = []
+    for cfg in cfg_files:
+        logging.info(f"\n>>> Running Validation Profile: {cfg} <<<")
 
-    for sample in input_samples:
-        uad.write_input(sample)
-        out = uad.read_output()
-        output_samples.append(out)
+        packed_coef, packed_csr = pack_config(cfg)
+        configure_unit(packed_coef, packed_csr)
 
-    return output_samples
+        logging.info(
+            f"SUT Active. Config: {cfg}, CoefReg: {hex(packed_coef)}"
+        )
+
+        all_results[cfg] = drive_signal('sqr.vec', input_signal_data)
+
+    # ===============================
+    # PLOTTING (UNCHANGED OUTPUT)
+    # ===============================
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Input vs Output Comparison for {args.unit}', fontsize=16)
+
+    for i, cfg in enumerate(cfg_files):
+        ax = axs[i // 2, i % 2]
+
+        ax.plot(
+            input_signal_data,
+            label='Input (square.vec)',
+            color='gray',
+            linestyle='--',
+            alpha=0.6
+        )
+        ax.plot(
+            all_results[cfg],
+            label='Filtered Output',
+            color='blue',
+            linewidth=2
+        )
+
+        ax.set_title(f"Configuration: {cfg}")
+        ax.legend(loc='upper right')
+        ax.grid(True)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
 
 if __name__ == "__main__":
-    impl = "impl0"
-    cfg_files = ["p0.cfg", "p4.cfg", "p7.cfg", "p9.cfg"]
-    vec_file = "square.vec"
-
-    uad = Uad(impl)
-    all_results = {}
-
-    for cfg in cfg_files:
-        print("\n==============================")
-        print(f"Testing coefficients from {cfg}")
-        print("==============================")
-        out_samples = run_filter_test(uad, cfg, vec_file)
-        all_results[cfg] = out_samples
-
-    # Print first 16 output samples per configuration for observation
-    print("\n=== Output Summary (first 16 samples) ===")
-    for cfg, samples in all_results.items():
-        print(f"\n{cfg}:")
-        for i, val in enumerate(samples[:16]):
-            print(f"  [{i:02d}] {val}")
+    run_validation()
